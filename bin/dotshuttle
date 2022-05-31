@@ -1,0 +1,320 @@
+#!/usr/bin/env ruby
+
+VERSION = '1.0.0'
+
+require 'optparse'
+require 'fileutils'
+require 'pathname'
+require 'toml'
+
+
+def raise_message(message)
+  STDERR.puts message
+  exit 1
+end
+
+def format_error(message) = "\e[31mERROR\e[0m: #{message}"
+
+def format_warning(message) = "\e[33mWARNING\e[0m: #{message}"
+
+def map_to_path(data)
+  return Pathname.new data if data.is_a? String
+  data.map do |path_string|
+    Pathname.new path_string
+  end
+end
+
+def load_items(path)
+  begin
+    raw_items = TOML.load_file path
+  rescue Errno::ENOENT
+    raise_message(format_error "No file found at #{path}.")
+  rescue Parslet::ParseFailed => error
+    raise_message(format_error error)
+  end
+  items = {}
+  raw_items.each do |name, paths|
+    items[name] = {}
+    items[name][:machine] = map_to_path(
+      paths['machine'] || paths['mc'] ||
+      raise_message(format_error "No machine path for item #{name}.")
+    )
+    items[name][:backup] = map_to_path(
+      paths['backup'] || paths['bk'] ||
+      raise_message(format_error "No backup path for item #{name}.")
+    )
+  end
+  items
+end
+
+def list(options)
+  load_items(options[:file]).each do |item, paths|
+    puts %(#{item}: machine:"#{paths[:machine]}", backup:"#{paths[:backup]}")
+  end
+end
+
+
+module Verbosity
+  RESULT = 0
+  PROGRESS = 1
+  PATHS = 2
+end
+
+
+class Copier
+  def initialize(options)
+    @options = options
+    @fails = []
+  end
+
+  class Result
+    attr_accessor :failed_copies, :bad_backup
+    def initialize(failed_copies, bad_backup: nil)
+      @failed_copies = failed_copies
+      @bad_backup = bad_backup
+    end
+    def to_s
+      (
+        @bad_backup ?
+          format_error(
+            %(Bad item "#{@bad_backup}" in the backup directory. Could not) +
+            " clean backups. Otherwise...\n"
+          )
+        : ''
+      ) + (
+        @failed_copies.empty? ?
+          'Operations completed successfully.'
+        : "Operations completed except for #{
+            @failed_copies.map { |fail| %("#{fail}") }.join(', ')
+          }."
+      )
+    end
+  end
+
+  def copy(specified_items, src_key, dest_key)
+    all_items = load_items(@options[:file])
+
+    # Finds out wrongly specified items and exit accordingly.
+    if specified_items.any? { |item| ! all_items.key? item }
+      raise_message(format_error "Specified item(s) #{
+        nonexistent_items.join(', ')
+      } does not exist.")
+    end
+
+    # Finds out actual items to copy
+    items = all_items.filter do |item, paths|
+      @options[:except]?
+        !specified_items.include?(item)
+      : specified_items.include?(item)
+    end
+
+    # Exits if no items are specified.
+    raise_message(format_error 'There are no items to copy.') if items.empty?
+
+    # Creates the backup directory.
+    @backup_dir = Pathname.new(@options[:backup]) + Time.now.to_i.to_s
+    FileUtils.mkdir_p @backup_dir
+
+    items.each_with_index do |(item, paths), item_index|
+      @current_item = item
+      src, dest = paths[src_key], paths[dest_key]
+
+      begin
+        # When paths are specified as strings.
+        if src.is_a?(Pathname) && dest.is_a?(Pathname)
+          if @options[:verbosity] >= Verbosity::PROGRESS
+            output = "Copying item [#{item_index+1}/#{items.length}]: #{item}"
+            if @options[:verbosity] >= Verbosity::PATHS
+              output += %( from "#{src}" to "#{dest}")
+            end
+            puts output
+          end
+
+          internal_copy(src, dest)
+
+        # When paths are specified as arrays.
+        elsif src.is_a?(Array) && dest.is_a?(Array)
+          if src.length != dest.length
+            handle_error 'Lengths of machine and backup paths do not match.'
+          end
+          if @options[:verbosity] >= Verbosity::PROGRESS
+            puts "Copying item [#{item_index+1}/#{items.length}]: #{item}"
+          end
+
+          src.zip(dest).each_with_index do |(this_src, this_dest), file_index|
+            if @options[:verbosity] >= Verbosity::PROGRESS
+              output = "\tfile [#{file_index+1}/#{src.length}]"
+              if @options[:verbosity] >= Verbosity::PATHS
+                output += %( from "#{this_src}" to "#{this_dest}")
+              end
+              puts output
+            end
+
+            internal_copy(this_src, this_dest)
+          end
+
+        else
+          handle_error 'Types of machine and backup paths are not correct.'
+        end
+
+      rescue InternalCopy::NoSourceError => error
+        handle_error "Source not found at #{error.path} for #{item}."
+      rescue InternalCopy::NoDestinationError => error
+        handle_error "Destination not found at #{error.path} for #{item}."
+      rescue StandardError => error
+        handle_error "An error occured while copying: #{error}."
+      end
+    end
+
+    # Removes redundant backups from the oldest.
+    bad_backup = nil
+    backups = Dir[@options[:backup] + '/*'].sort_by do |backup|
+      name = File.basename(backup)
+      begin
+        Integer(name)
+      rescue
+        bad_backup = name
+        break
+      end
+    end
+    unless bad_backup
+      backups[0...([0, backups.length-@options[:backup_count]].max)].each do
+        |backup|
+        FileUtils.rm_r(backup)
+      end
+    end
+
+    Result.new(@fails, bad_backup: bad_backup)
+  end
+
+  private
+
+  def handle_error(message)
+    if @options[:skip]
+      if @options[:verbosity] >= Verbosity::PROGRESS
+        puts(format_warning "#{message} Skipping the item...\n")
+      end
+      @fails << @current_item
+    else
+      raise_message(format_error(message + ' Operation could not finish.'))
+    end
+  end
+
+  def internal_copy(src, dest)
+    src, dest = src.expand_path, dest.expand_path
+
+    raise InternalCopy::NoSourceError.new(src) if !src.exist?
+
+    if dest.exist?
+      FileUtils.mkdir_p(@backup_dir + @current_item)
+      FileUtils.mv(
+        dest, @backup_dir + @current_item + dest.to_s.gsub(/\%+/) do |string|
+          '%' * (string.length-1)
+        end.gsub('/', '%')
+      )
+    elsif @options[:create]
+      FileUtils.mkdir_p(dest.dirname)
+    else
+      raise InternalCopy::NoDestinationError.new(dest)
+    end
+
+    FileUtils.cp_r(src, dest, remove_destination: true)
+  end
+  module InternalCopy
+    module Error
+      attr_accessor :path
+      def initialize(path)
+        @path = path
+      end
+    end
+    class NoSourceError < StandardError; include Error; end
+    class NoDestinationError < StandardError; include Error; end
+  end
+
+end
+
+
+actions = []
+options = {
+  file: Dir.home + '/.config/dotshuttle/items.toml',
+  backup: Dir.home + '/.cache/dotshuttle-backup',
+  backup_count: 2,
+  verbosity: 1,
+}
+option_parser = OptionParser.new do |opts|
+  opts.banner = <<~EOD
+    dotshuttle v#{VERSION}
+
+    Usage: #{$0} [action, options] [ITEMS...]
+    The capital options are actions and one, and only one should be specified.
+
+  EOD
+
+  opts.on('-H', '--help', 'Shows this help message and exits.') do
+    actions << :help
+  end
+  opts.on('-L', '--list', 'Lists items and exits.') do
+    actions << :list
+  end
+  opts.on('-G', '--get', 'Copies from the machine to the backup.') do
+    actions << :get
+  end
+  opts.on('-S', '--set', 'Copies from the backup to the machine.') do
+    actions << :set
+  end
+
+  opts.on(
+    '-f', '--file FILE',
+    %(Alternate path for items file. Default="#{options[:file]}"),
+  ) do |file|
+    options[:file] = file
+  end
+  opts.on(
+    '-b', '--backup DIR',
+    %(Alternate directory for storing backups. Default="#{options[:backup]}"),
+  ) { |dir| options[:backup] = dir }
+  opts.on(
+    '-k', '--backup-count NUMBER', Integer,
+    "Set how many steps are backed up. Default #{options[:backup_count]}."
+  ) { |number| options[:backup_count] = number }
+  opts.on('-e', '--except', 'Copies all items except specified.') do
+    options[:except] = true
+  end
+  opts.on('-c', '--create', 'Creates the destination if it does not exist.') do
+    options[:create] = true
+  end
+  opts.on('-s', '--skip', 'Skips failed operations and carries on.') do
+    options[:skip] = true
+  end
+  opts.on('-v', '--verbose', 'Increases verbosity level.') do
+    options[:verbosity] += 1
+  end
+  opts.on('-q', '--quiet', 'Decreases verbosity level.') do
+    options[:verbosity] -= 1
+  end
+end
+option_parser.parse!
+
+if actions.empty?
+  raise_message(
+    format_error 'An action needs to be specified. Use -H for help.'
+  )
+elsif actions.length > 1
+  raise_message(
+    format_error 'More than one action specified. Use -H for help.'
+  )
+end
+
+case actions[0]
+when :help
+  puts option_parser.help
+  exit
+when :list
+  list(options)
+  exit
+when :get
+  result = Copier.new(options).copy(ARGV, :machine, :backup)
+when :set
+  result = Copier.new(options).copy(ARGV, :backup, :machine)
+end
+puts result if options[:verbosity] >= Verbosity::RESULT
